@@ -1,0 +1,355 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DOORS AND KEYS</title>
+  <!--
+  ===== VERCEL DEPLOY NOTES =====
+  1) Create repo with this index.html
+  2) Add an API function at /api/pusher-auth.js with the contents shown in the chat (Node handler using Pusher server SDK)
+  3) In Vercel Project Settings → Environment Variables, set:
+     - PUSHER_APP_ID
+     - PUSHER_KEY (public)
+     - PUSHER_SECRET
+     - PUSHER_CLUSTER (e.g. mt1)
+  4) Redeploy. The client below will POST to /api/pusher-auth for presence-channel auth.
+  5) One player selects "Online Host" and connects to a room; the other selects "Online Client" with the same room.
+  -->
+  <style>
+    html, body { height: 100%; margin: 0; background: #111; color: #eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    #wrap { display: grid; place-items: center; height: 100%; gap: 12px; padding: 12px; }
+    canvas { background: #1d1f27; border: 2px solid #2c2f3a; border-radius: 12px; image-rendering: pixelated; }
+    .hud { text-align: center; opacity: 0.95; display: grid; gap: 8px; }
+    .hint { opacity: 0.7; font-size: 14px; }
+    .panel { display: grid; gap: 8px; background: #181a22; padding: 10px; border: 1px solid #2c2f3a; border-radius: 10px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center; }
+    input, select { background: #0f1117; border: 1px solid #2c2f3a; color: #eee; padding: 6px 8px; border-radius: 8px; }
+    button { background: #6a6cff; color: #111; font-weight: 700; border: none; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+    .ok { color: #7bd88f; }
+    .warn { color: #ffd166; }
+    kbd{background:#222;padding:2px 6px;border-radius:6px;border:1px solid #333}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="800" height="480"></canvas>
+    <div class="hud">
+      <div class="panel">
+        <div class="row">
+          <strong>Controls:</strong> <span>Player 1 — WASD (W jump) · Player 2 — Arrows (↑ jump) · <kbd>R</kbd> restart</span>
+        </div>
+        <div class="row">
+          <label>Mode:</label>
+          <select id="mode">
+            <option value="local">Local (same device)</option>
+            <option value="host">Online Host</option>
+            <option value="client">Online Client</option>
+          </select>
+          <input id="name" placeholder="Name (optional)"/>
+          <input id="room" placeholder="Room name (e.g. my-room-123)"/>
+          <button id="connect">Connect</button>
+          <span id="status" class="warn">Not connected</span>
+        </div>
+        <div class="hint">To play online: one player selects <em>Online Host</em> and shares the same <em>Room name</em>. The other selects <em>Online Client</em> and joins. Uses a realtime channel provider (Pusher-compatible). Replace keys below.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Optional: Pusher JS for simple pub/sub transport. You can swap to Ably, Supabase Realtime, etc. -->
+  <script src="https://js.pusher.com/8.2/pusher.min.js"></script>
+
+  <script>
+  // --- Simple 2P co-op prototype inspired by Pico Park ---
+  const TILE = 32;
+  const COLS = 25, ROWS = 15;
+  const GRAV = 0.8, FRICTION = 0.85, MOVE = 2.2, JUMP = 12;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // Network config (replace with your own - see README notes in chat)
+  const NET = {
+    ENABLED: false,
+    ROLE: 'local', // 'local' | 'host' | 'client'
+    ROOM: null,
+    NAME: null,
+    client: null, // Pusher instance
+    chan: null
+  };
+
+  // Level layout (25 x 15). 'X' = solid, '.' = empty
+  const map = [
+    ".................................".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    ".............XXX.................".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    "..........XXX....................".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    "....................XXX..........".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    ".............XXX.................".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    "XXXXXXXXXXXXXXXXXXXXXXXXX........".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    ".................................".slice(0, COLS),
+    "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".slice(0, COLS)
+  ];
+
+  function isSolid(tx, ty) {
+    if (tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) return true; // treat out of bounds as solid walls/floor
+    return map[ty][tx] === 'X';
+  }
+
+  function rectVsTileCollision(r) {
+    r.x += r.vx;
+    let x1 = Math.floor(r.x / TILE), x2 = Math.floor((r.x + r.w - 1) / TILE);
+    let y1 = Math.floor(r.y / TILE), y2 = Math.floor((r.y + r.h - 1) / TILE);
+    if (r.vx > 0) {
+      for (let ty = y1; ty <= y2; ty++) if (isSolid(x2, ty)) { r.x = x2 * TILE - r.w; r.vx = 0; break; }
+    } else if (r.vx < 0) {
+      for (let ty = y1; ty <= y2; ty++) if (isSolid(x1, ty)) { r.x = (x1 + 1) * TILE; r.vx = 0; break; }
+    }
+    r.y += r.vy;
+    x1 = Math.floor(r.x / TILE); x2 = Math.floor((r.x + r.w - 1) / TILE);
+    y1 = Math.floor(r.y / TILE); y2 = Math.floor((r.y + r.h - 1) / TILE);
+    r.onGround = false;
+    if (r.vy > 0) {
+      for (let tx = x1; tx <= x2; tx++) if (isSolid(tx, y2)) { r.y = y2 * TILE - r.h; r.vy = 0; r.onGround = true; break; }
+    } else if (r.vy < 0) {
+      for (let tx = x1; tx <= x2; tx++) if (isSolid(tx, y1)) { r.y = (y1 + 1) * TILE; r.vy = 0; break; }
+    }
+  }
+
+  function aabb(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+  function resolveStacking(top, bottom) {
+    const prevVy = top.vy;
+    if (aabb(top, bottom) && top.y + top.h <= bottom.y + 8 && prevVy >= 0) {
+      top.y = bottom.y - top.h; top.vy = 0; top.onGround = true; return true;
+    }
+    return false;
+  }
+
+  // Entities
+  function makePlayer(x, y, color) { return { x, y, w: 26, h: 26, vx: 0, vy: 0, onGround: false, color, carrying: false }; }
+  const p1 = makePlayer(64, 64, '#ff7a70');
+  const p2 = makePlayer(120, 64, '#6fe3ff');
+  const block = { x: 320, y: 320, w: 32, h: 32, vx: 0, vy: 0 };
+  const key = { x: 620, y: 256, w: 20, h: 12, taken: false };
+  const door = { x: 736, y: 416 - 64, w: 48, h: 64, open: false };
+
+  const keysDown = {};
+  addEventListener('keydown', e => { keysDown[e.code] = true; if (e.code === 'KeyR') reset(); });
+  addEventListener('keyup', e => keysDown[e.code] = false);
+
+  function reset() {
+    Object.assign(p1, { x:64, y:64, vx:0, vy:0, onGround:false });
+    Object.assign(p2, { x:120, y:64, vx:0, vy:0, onGround:false });
+    Object.assign(block, { x:320, y:320, vx:0, vy:0 });
+    Object.assign(key, { x:620, y:256, taken:false });
+    Object.assign(door, { open:false });
+    won = false; framesSinceWin = 0;
+  }
+
+  function movePlayer(p, left, right, jump) {
+    if (keysDown[left]) p.vx -= MOVE;
+    if (keysDown[right]) p.vx += MOVE;
+    p.vx *= FRICTION;
+    p.vy += GRAV;
+    const canJump = p.onGround;
+    if (keysDown[jump] && canJump) { p.vy = -JUMP; p.onGround = false; }
+    rectVsTileCollision(p);
+  }
+
+  function moveBlock(b) {
+    b.vy += GRAV; b.vx *= 0.9;
+    [p1, p2].forEach(p => {
+      if (aabb(p, {x:b.x-1,y:b.y,w:1,h:b.h}) && p.vx > 0) b.vx += 1.2;
+      if (aabb(p, {x:b.x+b.w,y:b.y,w:1,h:b.h}) && p.vx < 0) b.vx -= 1.2;
+    });
+    b.x += b.vx;
+    let x1 = Math.floor(b.x / TILE), x2 = Math.floor((b.x + b.w - 1) / TILE);
+    let y1 = Math.floor(b.y / TILE), y2 = Math.floor(b.y + b.h - 1);
+    if (b.vx > 0) { for (let ty = Math.floor(b.y/TILE); ty <= Math.floor((b.y+b.h-1)/TILE); ty++) if (isSolid(x2, ty)) { b.x = x2*TILE - b.w; b.vx = 0; break; } }
+    else if (b.vx < 0) { for (let ty = Math.floor(b.y/TILE); ty <= Math.floor((b.y+b.h-1)/TILE); ty++) if (isSolid(x1, ty)) { b.x = (x1+1)*TILE; b.vx = 0; break; } }
+    b.y += b.vy;
+    x1 = Math.floor(b.x / TILE); x2 = Math.floor((b.x + b.w - 1) / TILE);
+    if (b.vy > 0) { for (let tx = x1; tx <= x2; tx++) if (isSolid(tx, Math.floor((b.y+b.h-1)/TILE))) { b.y = Math.floor((b.y+b.h-1)/TILE)*TILE - b.h; b.vy = 0; break; } }
+    else if (b.vy < 0) { for (let tx = x1; tx <= x2; tx++) if (isSolid(tx, Math.floor(b.y/TILE))) { b.y = (Math.floor(b.y/TILE)+1)*TILE; b.vy = 0; break; } }
+  }
+
+  function drawGrid() {
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    for (let x = 0; x <= COLS; x++) { ctx.beginPath(); ctx.moveTo(x*TILE, 0); ctx.lineTo(x*TILE, ROWS*TILE); ctx.stroke(); }
+    for (let y = 0; y <= ROWS; y++) { ctx.beginPath(); ctx.moveTo(0, y*TILE); ctx.lineTo(COLS*TILE, y*TILE); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  function drawLevel() {
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (isSolid(x, y)) { ctx.fillStyle = '#2b2f3a'; ctx.fillRect(x*TILE, y*TILE, TILE, TILE); }
+  }
+
+  function drawKey() {
+    if (key.taken) return; ctx.save(); ctx.translate(key.x, key.y); ctx.fillStyle = '#ffd166'; ctx.fillRect(0, 0, key.w, key.h);
+    ctx.fillRect(key.w-6, 4, 10, 4); ctx.beginPath(); ctx.arc(key.w + 6, key.h/2, 6, 0, Math.PI*2); ctx.fill(); ctx.restore(); }
+
+  function drawDoor() {
+    ctx.save(); ctx.fillStyle = door.open ? '#7bd88f' : '#9959ff'; ctx.fillRect(door.x, door.y, door.w, door.h); ctx.fillStyle = '#111'; ctx.fillRect(door.x + 10, door.y + 10, door.w - 20, door.h - 20); ctx.restore(); }
+
+  function drawPlayer(p) { ctx.save(); ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle = '#111'; ctx.fillRect(p.x + 7, p.y + 8, 4, 6); ctx.fillRect(p.x + p.w - 11, p.y + 8, 4, 6); ctx.restore(); }
+
+  function drawBlock(b) { ctx.save(); ctx.fillStyle = '#c0c7d3'; ctx.fillRect(b.x, b.y, b.w, b.h); ctx.strokeStyle = '#8a93a3'; ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1); ctx.restore(); }
+
+  function clamp(val, min, max){ return Math.max(min, Math.min(max, val)); }
+
+  let won = false; let framesSinceWin = 0;
+
+  // --- Net helpers ---
+  function snapshot() {
+    return { p1:{x:p1.x,y:p1.y,vx:p1.vx,vy:p1.vy,onGround:p1.onGround}, p2:{x:p2.x,y:p2.y,vx:p2.vx,vy:p2.vy,onGround:p2.onGround}, block:{x:block.x,y:block.y,vx:block.vx,vy:block.vy}, key:{x:key.x,y:key.y,taken:key.taken}, door:{open:door.open}, won, framesSinceWin };
+  }
+  function loadSnapshot(s) {
+    Object.assign(p1, s.p1); Object.assign(p2, s.p2); Object.assign(block, s.block); Object.assign(key, s.key); Object.assign(door, s.door); won = s.won; framesSinceWin = s.framesSinceWin;
+  }
+
+  // Throttle broadcast
+  let lastSend = 0; const SEND_MS = 80; // ~12.5Hz
+
+  function tickHost() {
+    // Host: p1 local, p2 applies remote inputs (mirrored to keysDown for simplicity)
+    movePlayer(p1, 'KeyA', 'KeyD', 'KeyW');
+    // Apply virtual keys for p2 from network
+    movePlayer(p2, 'ArrowLeft', 'ArrowRight', 'ArrowUp');
+    resolveStacking(p1, p2); resolveStacking(p2, p1);
+    moveBlock(block);
+    [p1, p2].forEach(p => {
+      if (aabb(p, block)) {
+        const dx1 = (p.x + p.w) - block.x, dx2 = (block.x + block.w) - p.x;
+        const dy1 = (p.y + p.h) - block.y, dy2 = (block.y + block.h) - p.y;
+        const minX = Math.min(dx1, dx2), minY = Math.min(dy1, dy2);
+        if (minX < minY) { if (dx1 < dx2) { p.x = block.x - p.w; p.vx = Math.min(p.vx, 0); block.vx += 0.6; } else { p.x = block.x + block.w; p.vx = Math.max(p.vx, 0); block.vx -= 0.6; } }
+        else { if (dy1 < dy2) { p.y = block.y - p.h; p.vy = 0; p.onGround = true; } else { p.y = block.y + block.h; p.vy = Math.min(0, p.vy); } }
+      }
+    });
+    [p1, p2].forEach(p => { p.x = clamp(p.x, 0, COLS*TILE - p.w); });
+    if (!key.taken && (aabb(p1, key) || aabb(p2, key))) key.taken = true;
+    door.open = key.taken;
+    const doorArea = { x: door.x + 6, y: door.y + 6, w: door.w - 12, h: door.h - 12 };
+    if (door.open && aabb(p1, doorArea) && aabb(p2, doorArea)) { won = true; framesSinceWin++; } else { framesSinceWin = 0; }
+
+    if (NET.ENABLED && NET.ROLE === 'host' && performance.now() - lastSend > SEND_MS) {
+      lastSend = performance.now();
+      NET.chan?.trigger('client-event', { type:'state', s: snapshot() });
+    }
+  }
+
+  function tickClient() {
+    // Client: only moves P2 locally, but does not simulate world; relies on host snapshots
+    // Send input state to host
+    if (NET.ENABLED && NET.ROLE === 'client' && performance.now() - lastSend > 40) {
+      lastSend = performance.now();
+      NET.chan?.trigger('client-event', { type:'input', keys: pickClientKeys() });
+    }
+  }
+
+  function pickClientKeys(){
+    return { ArrowLeft: !!keysDown['ArrowLeft'], ArrowRight: !!keysDown['ArrowRight'], ArrowUp: !!keysDown['ArrowUp'], KeyR: !!keysDown['KeyR'] };
+  }
+
+  function render() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    drawLevel(); drawGrid(); drawDoor(); drawKey(); drawBlock(block); drawPlayer(p1); drawPlayer(p2);
+    if (key.taken && !won) { ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = '16px system-ui'; ctx.fillText('Key: ✓', 12, 22); }
+    if (won) { ctx.save(); ctx.globalAlpha = 0.9; ctx.fillStyle = '#0a0'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.restore(); ctx.fillStyle = '#fff'; ctx.font = '32px system-ui'; ctx.fillText('Level Complete! 🎉  Press R to restart', 110, 240); }
+  }
+
+  function tick() {
+    if (!NET.ENABLED || NET.ROLE === 'local') {
+      // Local-only gameplay (same as before)
+      movePlayer(p1, 'KeyA', 'KeyD', 'KeyW');
+      movePlayer(p2, 'ArrowLeft', 'ArrowRight', 'ArrowUp');
+      resolveStacking(p1, p2); resolveStacking(p2, p1); moveBlock(block);
+      [p1, p2].forEach(p => { if (aabb(p, block)) {
+        const dx1 = (p.x + p.w) - block.x, dx2 = (block.x + block.w) - p.x;
+        const dy1 = (p.y + p.h) - block.y, dy2 = (block.y + block.h) - p.y;
+        const minX = Math.min(dx1, dx2), minY = Math.min(dy1, dy2);
+        if (minX < minY) { if (dx1 < dx2) { p.x = block.x - p.w; p.vx = Math.min(p.vx, 0); block.vx += 0.6; } else { p.x = block.x + block.w; p.vx = Math.max(p.vx, 0); block.vx -= 0.6; } }
+        else { if (dy1 < dy2) { p.y = block.y - p.h; p.vy = 0; p.onGround = true; } else { p.y = block.y + block.h; p.vy = Math.min(0, p.vy); } }
+      }});
+      [p1, p2].forEach(p => { p.x = clamp(p.x, 0, COLS*TILE - p.w); });
+      if (!key.taken && (aabb(p1, key) || aabb(p2, key))) key.taken = true; door.open = key.taken;
+      const doorArea = { x: door.x + 6, y: door.y + 6, w: door.w - 12, h: door.h - 12 };
+      if (door.open && aabb(p1, doorArea) && aabb(p2, doorArea)) { won = true; framesSinceWin++; } else { framesSinceWin = 0; }
+    } else if (NET.ROLE === 'host') {
+      tickHost();
+    } else if (NET.ROLE === 'client') {
+      tickClient();
+    }
+
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  // --- Networking setup (Pusher-compatible) ---
+  const modeSel = document.getElementById('mode');
+  const roomInput = document.getElementById('room');
+  const statusEl = document.getElementById('status');
+  document.getElementById('connect').onclick = async () => {
+    NET.ROLE = modeSel.value; NET.ROOM = (roomInput.value||'').trim(); NET.NAME = (document.getElementById('name').value||'').trim();
+    if (NET.ROLE === 'local') { NET.ENABLED = false; statusEl.textContent = 'Local mode'; statusEl.className='ok'; return; }
+    if (!NET.ROOM) { alert('Enter a room name'); return; }
+
+    // Configure your provider here (Pusher Channels example):
+    // Create an app at https://dashboard.pusher.com/ and set Vercel env vars for server auth.
+    // Expose PUSHER_KEY and PUSHER_CLUSTER to the browser via replacement or build step.
+    const PUSHER_KEY = window.PUSHER_KEY || 'REPLACE_ME_PUBLIC_KEY'; // or inject at build time
+    const PUSHER_CLUSTER = window.PUSHER_CLUSTER || 'REPLACE_ME_CLUSTER';
+
+    if (PUSHER_KEY.startsWith('REPLACE_ME')) { alert('Set PUSHER_KEY / PUSHER_CLUSTER (public)'); return; }
+
+    Pusher.logToConsole = false;
+    NET.client = new Pusher(PUSHER_KEY, {
+      cluster: PUSHER_CLUSTER,
+      forceTLS: true,
+      authEndpoint: '/api/pusher-auth', // Vercel Function you will add
+      auth: {
+        headers: { 'Content-Type': 'application/json' },
+        params: () => ({ name: NET.NAME || '' })
+      }
+    });
+
+    const channelName = `presence-${NET.ROOM}`;
+    NET.chan = NET.client.subscribe(channelName);
+
+    NET.chan.bind('pusher:subscription_succeeded', (members) => {
+      NET.ENABLED = true; statusEl.textContent = `Connected as ${NET.ROLE} in ${NET.ROOM} (${members.count} online)`; statusEl.className='ok';
+      if (NET.ROLE === 'client') {
+        NET.chan.trigger('client-event', { type:'hello' });
+      }
+    });
+
+    NET.chan.bind('pusher:member_added', (member) => {
+      // could show presence in UI
+    });
+
+    NET.chan.bind('client-event', (msg) => {
+      if (!msg || !msg.type) return;
+      if (NET.ROLE === 'host' && msg.type === 'input') {
+        keysDown['ArrowLeft'] = !!msg.keys.ArrowLeft;
+        keysDown['ArrowRight'] = !!msg.keys.ArrowRight;
+        keysDown['ArrowUp'] = !!msg.keys.ArrowUp;
+        if (msg.keys.KeyR) reset();
+      }
+      if (NET.ROLE === 'client') {
+        if (msg.type === 'state' && msg.s) { loadSnapshot(msg.s); }
+      }
+    });
+  };
+
+  reset();
+  tick();
+  </script>
+</body>
+</html>
