@@ -3,32 +3,38 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DOORS AND KEYS</title>
+  <title>2-Player Co‑op Pico‑Style Prototype (Local + Online)</title>
   <!--
   ===== VERCEL DEPLOY NOTES =====
-  1) Create repo with this index.html
-  2) Add an API function at /api/pusher-auth.js with the contents shown in the chat (Node handler using Pusher server SDK)
-  3) In Vercel Project Settings → Environment Variables, set:
-     - PUSHER_APP_ID
-     - PUSHER_KEY (public)
-     - PUSHER_SECRET
-     - PUSHER_CLUSTER (e.g. mt1)
-  4) Redeploy. The client below will POST to /api/pusher-auth for presence-channel auth.
-  5) One player selects "Online Host" and connects to a room; the other selects "Online Client" with the same room.
+  Files to add in your repo:
+  - index.html (this file)
+  - /api/pusher-auth.js  (Serverless auth for private/presence)
+  - /api/public-config.js (Returns public Pusher key + cluster)
+
+  Vercel → Project → Settings → Environment Variables
+  - PUSHER_APP_ID
+  - PUSHER_KEY            (public)
+  - PUSHER_SECRET
+  - PUSHER_CLUSTER        (e.g. mt1)
+
+  The browser fetches /api/public-config to get the public key + cluster.
+  The browser authenticates presence channels via /api/pusher-auth.
   -->
   <style>
-    html, body { height: 100%; margin: 0; background: #111; color: #eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    html, body { height: 100%; margin: 0; background: #111; color: #eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu; }
     #wrap { display: grid; place-items: center; height: 100%; gap: 12px; padding: 12px; }
     canvas { background: #1d1f27; border: 2px solid #2c2f3a; border-radius: 12px; image-rendering: pixelated; }
     .hud { text-align: center; opacity: 0.95; display: grid; gap: 8px; }
-    .hint { opacity: 0.7; font-size: 14px; }
-    .panel { display: grid; gap: 8px; background: #181a22; padding: 10px; border: 1px solid #2c2f3a; border-radius: 10px; }
+    .hint { opacity: 0.75; font-size: 14px; }
+    .panel { display: grid; gap: 10px; background: #181a22; padding: 12px; border: 1px solid #2c2f3a; border-radius: 10px; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center; }
     input, select { background: #0f1117; border: 1px solid #2c2f3a; color: #eee; padding: 6px 8px; border-radius: 8px; }
     button { background: #6a6cff; color: #111; font-weight: 700; border: none; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
     .ok { color: #7bd88f; }
     .warn { color: #ffd166; }
-    kbd{background:#222;padding:2px 6px;border-radius:6px;border:1px solid #333}
+    kbd { background:#222; padding:2px 6px; border-radius:6px; border:1px solid #333 }
+    .members { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+    .badge { background:#2b2f3a; border:1px solid #394055; padding:4px 8px; border-radius:999px; font-size:12px; }
   </style>
 </head>
 <body>
@@ -51,17 +57,13 @@
           <button id="connect">Connect</button>
           <span id="status" class="warn">Not connected</span>
         </div>
-        <div class="hint">To play online: one player selects <em>Online Host</em> and shares the same <em>Room name</em>. The other selects <em>Online Client</em> and joins. Uses a realtime channel provider (Pusher-compatible). Replace keys below.</div>
+        <div class="row members" id="members"></div>
+        <div class="hint">Online: Host creates a room and connects; Client joins the same room. This app fetches Pusher <em>key</em>/<em>cluster</em> from <code>/api/public-config</code> and does presence auth via <code>/api/pusher-auth</code>.</div>
       </div>
     </div>
   </div>
-<script>
-  window.PUSHER_KEY = "189734e95a69d587fb9c";
-  window.PUSHER_CLUSTER = "ap2"; // e.g. "mt1"
-</script>
-  <!-- Optional: Pusher JS for simple pub/sub transport. You can swap to Ably, Supabase Realtime, etc. -->
-  <script src="https://js.pusher.com/8.2/pusher.min.js"></script>
 
+  <script src="https://js.pusher.com/8.2/pusher.min.js"></script>
   <script>
   // --- Simple 2P co-op prototype inspired by Pico Park ---
   const TILE = 32;
@@ -71,14 +73,16 @@
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
 
-  // Network config (replace with your own - see README notes in chat)
+  // Network config (set by API fetch)
   const NET = {
     ENABLED: false,
     ROLE: 'local', // 'local' | 'host' | 'client'
     ROOM: null,
     NAME: null,
     client: null, // Pusher instance
-    chan: null
+    chan: null,
+    key: null,
+    cluster: null
   };
 
   // Level layout (25 x 15). 'X' = solid, '.' = empty
@@ -106,6 +110,7 @@
   }
 
   function rectVsTileCollision(r) {
+    // X axis
     r.x += r.vx;
     let x1 = Math.floor(r.x / TILE), x2 = Math.floor((r.x + r.w - 1) / TILE);
     let y1 = Math.floor(r.y / TILE), y2 = Math.floor((r.y + r.h - 1) / TILE);
@@ -114,6 +119,7 @@
     } else if (r.vx < 0) {
       for (let ty = y1; ty <= y2; ty++) if (isSolid(x1, ty)) { r.x = (x1 + 1) * TILE; r.vx = 0; break; }
     }
+    // Y axis
     r.y += r.vy;
     x1 = Math.floor(r.x / TILE); x2 = Math.floor((r.x + r.w - 1) / TILE);
     y1 = Math.floor(r.y / TILE); y2 = Math.floor((r.y + r.h - 1) / TILE);
@@ -174,7 +180,6 @@
     });
     b.x += b.vx;
     let x1 = Math.floor(b.x / TILE), x2 = Math.floor((b.x + b.w - 1) / TILE);
-    let y1 = Math.floor(b.y / TILE), y2 = Math.floor(b.y + b.h - 1);
     if (b.vx > 0) { for (let ty = Math.floor(b.y/TILE); ty <= Math.floor((b.y+b.h-1)/TILE); ty++) if (isSolid(x2, ty)) { b.x = x2*TILE - b.w; b.vx = 0; break; } }
     else if (b.vx < 0) { for (let ty = Math.floor(b.y/TILE); ty <= Math.floor((b.y+b.h-1)/TILE); ty++) if (isSolid(x1, ty)) { b.x = (x1+1)*TILE; b.vx = 0; break; } }
     b.y += b.vy;
@@ -190,24 +195,25 @@
     ctx.restore();
   }
 
-  function drawLevel() {
-    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (isSolid(x, y)) { ctx.fillStyle = '#2b2f3a'; ctx.fillRect(x*TILE, y*TILE, TILE, TILE); }
-  }
-
-  function drawKey() {
-    if (key.taken) return; ctx.save(); ctx.translate(key.x, key.y); ctx.fillStyle = '#ffd166'; ctx.fillRect(0, 0, key.w, key.h);
-    ctx.fillRect(key.w-6, 4, 10, 4); ctx.beginPath(); ctx.arc(key.w + 6, key.h/2, 6, 0, Math.PI*2); ctx.fill(); ctx.restore(); }
-
-  function drawDoor() {
-    ctx.save(); ctx.fillStyle = door.open ? '#7bd88f' : '#9959ff'; ctx.fillRect(door.x, door.y, door.w, door.h); ctx.fillStyle = '#111'; ctx.fillRect(door.x + 10, door.y + 10, door.w - 20, door.h - 20); ctx.restore(); }
-
+  function drawLevel() { for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (isSolid(x, y)) { ctx.fillStyle = '#2b2f3a'; ctx.fillRect(x*TILE, y*TILE, TILE, TILE); } }
+  function drawKey() { if (key.taken) return; ctx.save(); ctx.translate(key.x, key.y); ctx.fillStyle = '#ffd166'; ctx.fillRect(0, 0, key.w, key.h); ctx.fillRect(key.w-6, 4, 10, 4); ctx.beginPath(); ctx.arc(key.w + 6, key.h/2, 6, 0, Math.PI*2); ctx.fill(); ctx.restore(); }
+  function drawDoor() { ctx.save(); ctx.fillStyle = door.open ? '#7bd88f' : '#9959ff'; ctx.fillRect(door.x, door.y, door.w, door.h); ctx.fillStyle = '#111'; ctx.fillRect(door.x + 10, door.y + 10, door.w - 20, door.h - 20); ctx.restore(); }
   function drawPlayer(p) { ctx.save(); ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle = '#111'; ctx.fillRect(p.x + 7, p.y + 8, 4, 6); ctx.fillRect(p.x + p.w - 11, p.y + 8, 4, 6); ctx.restore(); }
-
   function drawBlock(b) { ctx.save(); ctx.fillStyle = '#c0c7d3'; ctx.fillRect(b.x, b.y, b.w, b.h); ctx.strokeStyle = '#8a93a3'; ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1); ctx.restore(); }
-
   function clamp(val, min, max){ return Math.max(min, Math.min(max, val)); }
 
   let won = false; let framesSinceWin = 0;
+
+  // --- Presence UI helpers ---
+  const membersEl = document.getElementById('members');
+  function renderMembers() {
+    if (!NET.chan || !NET.chan.members) { membersEl.innerHTML = ''; return; }
+    const list = [];
+    try {
+      NET.chan.members.each((m) => { list.push(m.info?.name || 'Guest'); });
+    } catch (e) { /* older SDKs may differ */ }
+    membersEl.innerHTML = list.map(n => `<span class="badge">${n}</span>`).join('');
+  }
 
   // --- Net helpers ---
   function snapshot() {
@@ -217,13 +223,10 @@
     Object.assign(p1, s.p1); Object.assign(p2, s.p2); Object.assign(block, s.block); Object.assign(key, s.key); Object.assign(door, s.door); won = s.won; framesSinceWin = s.framesSinceWin;
   }
 
-  // Throttle broadcast
   let lastSend = 0; const SEND_MS = 80; // ~12.5Hz
 
   function tickHost() {
-    // Host: p1 local, p2 applies remote inputs (mirrored to keysDown for simplicity)
     movePlayer(p1, 'KeyA', 'KeyD', 'KeyW');
-    // Apply virtual keys for p2 from network
     movePlayer(p2, 'ArrowLeft', 'ArrowRight', 'ArrowUp');
     resolveStacking(p1, p2); resolveStacking(p2, p1);
     moveBlock(block);
@@ -249,8 +252,7 @@
   }
 
   function tickClient() {
-    // Client: only moves P2 locally, but does not simulate world; relies on host snapshots
-    // Send input state to host
+    // Client: send input to host; state will be received from host
     if (NET.ENABLED && NET.ROLE === 'client' && performance.now() - lastSend > 40) {
       lastSend = performance.now();
       NET.chan?.trigger('client-event', { type:'input', keys: pickClientKeys() });
@@ -270,7 +272,7 @@
 
   function tick() {
     if (!NET.ENABLED || NET.ROLE === 'local') {
-      // Local-only gameplay (same as before)
+      // Local-only
       movePlayer(p1, 'KeyA', 'KeyD', 'KeyW');
       movePlayer(p2, 'ArrowLeft', 'ArrowRight', 'ArrowUp');
       resolveStacking(p1, p2); resolveStacking(p2, p1); moveBlock(block);
@@ -299,28 +301,29 @@
   const modeSel = document.getElementById('mode');
   const roomInput = document.getElementById('room');
   const statusEl = document.getElementById('status');
+
   document.getElementById('connect').onclick = async () => {
     NET.ROLE = modeSel.value; NET.ROOM = (roomInput.value||'').trim(); NET.NAME = (document.getElementById('name').value||'').trim();
     if (NET.ROLE === 'local') { NET.ENABLED = false; statusEl.textContent = 'Local mode'; statusEl.className='ok'; return; }
     if (!NET.ROOM) { alert('Enter a room name'); return; }
 
-    // Configure your provider here (Pusher Channels example):
-    // Create an app at https://dashboard.pusher.com/ and set Vercel env vars for server auth.
-    // Expose PUSHER_KEY and PUSHER_CLUSTER to the browser via replacement or build step.
-    const PUSHER_KEY = window.PUSHER_KEY || 'REPLACE_ME_PUBLIC_KEY'; // or inject at build time
-    const PUSHER_CLUSTER = window.PUSHER_CLUSTER || 'REPLACE_ME_CLUSTER';
+    // Fetch safe public config (key + cluster)
+    try {
+      const res = await fetch('/api/public-config');
+      if (!res.ok) throw new Error('Public config missing');
+      const cfg = await res.json();
+      NET.key = cfg.key; NET.cluster = cfg.cluster;
+    } catch (e) {
+      console.error(e); alert('Pusher public config not found. Add /api/public-config.js and set env vars.'); return;
+    }
 
-    if (PUSHER_KEY.startsWith('REPLACE_ME')) { alert('Set PUSHER_KEY / PUSHER_CLUSTER (public)'); return; }
-
+    // Create client (let Pusher send urlencoded POST to /api/pusher-auth)
     Pusher.logToConsole = false;
-    NET.client = new Pusher(PUSHER_KEY, {
-      cluster: PUSHER_CLUSTER,
+    NET.client = new Pusher(NET.key, {
+      cluster: NET.cluster,
       forceTLS: true,
-      authEndpoint: '/api/pusher-auth', // Vercel Function you will add
-      auth: {
-        headers: { 'Content-Type': 'application/json' },
-        params: () => ({ name: NET.NAME || '' })
-      }
+      authEndpoint: '/api/pusher-auth',
+      auth: { params: () => ({ name: NET.NAME || '' }) }
     });
 
     const channelName = `presence-${NET.ROOM}`;
@@ -328,14 +331,12 @@
 
     NET.chan.bind('pusher:subscription_succeeded', (members) => {
       NET.ENABLED = true; statusEl.textContent = `Connected as ${NET.ROLE} in ${NET.ROOM} (${members.count} online)`; statusEl.className='ok';
-      if (NET.ROLE === 'client') {
-        NET.chan.trigger('client-event', { type:'hello' });
-      }
+      renderMembers();
+      if (NET.ROLE === 'client') { NET.chan.trigger('client-event', { type:'hello' }); }
     });
 
-    NET.chan.bind('pusher:member_added', (member) => {
-      // could show presence in UI
-    });
+    NET.chan.bind('pusher:member_added', () => renderMembers());
+    NET.chan.bind('pusher:member_removed', () => renderMembers());
 
     NET.chan.bind('client-event', (msg) => {
       if (!msg || !msg.type) return;
